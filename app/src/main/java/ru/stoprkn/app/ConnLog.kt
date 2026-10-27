@@ -6,15 +6,48 @@ import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
 import java.text.SimpleDateFormat
+import java.util.ArrayDeque
 import java.util.Date
 import java.util.Locale
 
 object ConnLog {
     private val lock = Any()
+    private val lines = ArrayDeque<String>()
     @Volatile private var folder: java.io.File? = null
+    private var loaded = false
+    private var writerStarted = false
+    private var dirty = false
 
     fun attach(context: Context) {
         folder = context.filesDir
+        synchronized(lock) {
+            if (!loaded) {
+                loaded = true
+                val existing = file()?.takeIf { it.exists() }?.readLines().orEmpty()
+                existing.takeLast(250).forEach { lines.addLast(it) }
+            }
+            if (!writerStarted) {
+                writerStarted = true
+                Thread({
+                    while (true) {
+                        val body = synchronized(lock) {
+                            if (!dirty) {
+                                try {
+                                    (lock as java.lang.Object).wait(1000)
+                                } catch (_: InterruptedException) {
+                                }
+                            }
+                            dirty = false
+                            lines.joinToString("\n")
+                        }
+                        try {
+                            file()?.writeText(body)
+                        } catch (_: Exception) {
+                        }
+                    }
+                }, "stopRKN-log").apply { isDaemon = true }.start()
+            }
+        }
     }
 
     private fun file(): java.io.File? = folder?.resolve("conn.log")
@@ -23,19 +56,25 @@ object ConnLog {
         val clock = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())
         val line = "$clock  $text"
         synchronized(lock) {
-            val log = file() ?: return
-            val existing = if (log.exists()) log.readLines() else emptyList()
-            log.writeText((existing + line).takeLast(250).joinToString("\n"))
+            lines.addLast(line)
+            while (lines.size > 250) lines.removeFirst()
+            dirty = true
+            (lock as java.lang.Object).notifyAll()
         }
     }
 
     fun text(): String = synchronized(lock) {
-        val body = file()?.takeIf { it.exists() }?.readText().orEmpty().trim()
-        body.ifBlank { "Пока пусто. Включите маршрутизацию и откройте сайт." }
+        lines.joinToString("\n").trim().ifBlank {
+            "Пока пусто. Включите маршрутизацию и откройте сайт."
+        }
     }
 
     fun clear() {
-        synchronized(lock) { file()?.writeText("") }
+        synchronized(lock) {
+            lines.clear()
+            dirty = true
+            (lock as java.lang.Object).notifyAll()
+        }
     }
 
     fun export(context: Context): String {

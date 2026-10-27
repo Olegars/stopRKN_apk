@@ -9,8 +9,8 @@ android {
         applicationId = "ru.stoprkn.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 16
-        versionName = "0.9.15"
+        versionCode = 19
+        versionName = "0.9.18"
     }
     buildTypes {
         release {

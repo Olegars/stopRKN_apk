@@ -47,7 +47,7 @@ object SocialCatalog {
         SocialNet("youtube", "YouTube", listOf(
             "youtube.com", "youtu.be", "youtube-nocookie.com", "youtubekids.com",
             "googlevideo.com", "ytimg.com", "ggpht.com", "gstatic.com",
-            "googleusercontent.com", "googleapis.com"
+            "googleusercontent.com", "googleapis.com", "google.com"
         ), "nets/google.txt"),
         SocialNet("instagram", "Instagram", listOf(
             "instagram.com", "cdninstagram.com", "instagram.net", "ig.me", "igsonar.com"

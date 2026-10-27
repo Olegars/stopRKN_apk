@@ -25,9 +25,13 @@ import java.net.DatagramSocket
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
+import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
+import java.util.concurrent.Semaphore
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.random.Random
 
 class StopVpnService : VpnService() {
@@ -40,6 +44,17 @@ class StopVpnService : VpnService() {
     private val detachWarned = AtomicBoolean(false)
     private val workers = Executors.newCachedThreadPool()
     private val outLock = Any()
+    private val tunUrgent = ArrayBlockingQueue<ByteArray>(96)
+    private val tunInteractive = ArrayBlockingQueue<ByteArray>(64)
+    private val tunBulk = ArrayBlockingQueue<ByteArray>(48)
+    private val bulkInflight = AtomicInteger(0)
+    private val dialSlots = Semaphore(24, true)
+    private val proxySlots = Semaphore(48, true)
+    private val dnsSlots = Semaphore(8, true)
+    private val dnsCache = ConcurrentHashMap<String, DnsHit>()
+    private val icmpAt = HashMap<String, Long>()
+    private var lastDnsLog = 0L
+    @Volatile private var writer: Thread? = null
     private var ipId = 1
     private lateinit var nets: Map<String, List<Cidr>>
 
@@ -97,6 +112,7 @@ class StopVpnService : VpnService() {
         active = true
         VpnState.beat(this)
         startBeat()
+        startWriter()
         Thread({ pump(FileInputStream(fd.fileDescriptor)) }, "stopRKN-tun").start()
         return START_STICKY
     }
@@ -259,24 +275,21 @@ class StopVpnService : VpnService() {
         val udpLen = u16(buf, ihl + 4)
         val payloadLen = (udpLen - 8).coerceAtMost(total - ihl - 8)
         if (dstPort != 53 || payloadLen <= 0) {
-            if (dstPort != 53 && payloadLen > 0) noteUdp(dstIp, dstPort)
+            if (dstPort != 53 && payloadLen > 0) rejectUdp(buf, total, srcIp, dstIp, srcPort, dstPort)
             return
         }
         val payload = buf.copyOfRange(ihl + 8, ihl + 8 + payloadLen)
         workers.execute {
             try {
-                val socket = DatagramSocket()
-                detach(socket)
-                socket.soTimeout = 4000
-                socket.send(DatagramPacket(payload, payload.size, InetAddress.getByName("1.1.1.1"), 53))
-                val reply = ByteArray(1500)
-                val packet = DatagramPacket(reply, reply.size)
-                socket.receive(packet)
-                socket.close()
-                sendUdp(dstIp, srcIp, 53, srcPort, reply, packet.length)
+                val reply = lookupDns(payload)
+                if (reply == null) {
+                    logDnsFail(dstIp)
+                    return@execute
+                }
+                sendUdp(dstIp, srcIp, 53, srcPort, reply, reply.size)
             } catch (error: Exception) {
                 Log.w(TAG, "dns: ${error.message}")
-                ConnLog.add("DNS ${ipText(dstIp)} — ${error.message ?: "ошибка"}")
+                logDnsFail(dstIp)
             }
         }
     }
@@ -306,12 +319,14 @@ class StopVpnService : VpnService() {
             }
             if (flows.size > 300) return
             val flow = Flow(srcIp, dstIp, srcPort, dstPort, (seq + 1) and MASK, Random.nextLong() and MASK, android.os.SystemClock.elapsedRealtime())
+            flow.onClose = { releaseBulk(flow) }
             flows[key] = flow
             sendTcp(flow, SYN or ACK, null, 0)
             return
         }
         val flow = flows[key] ?: return
         if (flow.closed) return
+        if (flags and ACK != 0) acceptAck(flow, u32(buf, ihl + 8), u16(buf, ihl + 14))
         if (payloadLen > 0) {
             if (seq != flow.expect) {
                 if (seq < flow.expect) sendTcp(flow, ACK, null, 0)
@@ -382,6 +397,7 @@ class StopVpnService : VpnService() {
         val decision = decideRoute(host, flow.dstIp.toInt(), flow.dstPort, config, nets)
         val dest = "${host ?: ipText(flow.dstIp)}:${flow.dstPort}"
         flow.label = dest
+        flow.priority = decision.summary == "Telegram"
         if (decision.kind == RouteKind.BLOCK) {
             Log.i(TAG, "$dest → блок (${decision.summary})")
             ConnLog.add("$dest → блок (${decision.summary})")
@@ -403,35 +419,76 @@ class StopVpnService : VpnService() {
         }
         Log.i(TAG, "$dest → $via")
         ConnLog.add("$dest → $via")
-        if (decision.kind == RouteKind.PROXY && proxy != null) {
-            socket.connect(InetSocketAddress(proxy.host, proxy.port), 15000)
-            httpConnect(socket, host ?: ipText(flow.dstIp), flow.dstPort, proxy)
-        } else {
-            socket.connect(InetSocketAddress(ipText(flow.dstIp), flow.dstPort), 15000)
-        }
-        ConnLog.add("$dest — открыто с ${socket.localAddress?.hostAddress ?: "?"}")
-        synchronized(flow) {
-            if (flow.closed) {
-                socket.close()
-                return
+        var dialPermit = false
+        var failed: Exception? = null
+        try {
+            if (decision.kind == RouteKind.PROXY && proxy != null) {
+                if (!flow.priority) {
+                    if (!dialSlots.tryAcquire(8, TimeUnit.SECONDS)) {
+                        throw IllegalStateException("прокси занят, повтор позже")
+                    }
+                    dialPermit = true
+                }
+                if (!flow.closed) {
+                    socket.connect(InetSocketAddress(proxy.host, proxy.port), 15000)
+                    httpConnect(socket, host ?: ipText(flow.dstIp), flow.dstPort, proxy)
+                }
+            } else if (!flow.closed) {
+                socket.connect(InetSocketAddress(ipText(flow.dstIp), flow.dstPort), 15000)
             }
-            socket.getOutputStream().write(flow.buffered.toByteArray())
-            flow.buffered.reset()
-            flow.upstream = socket
-            flow.dialing = false
+        } catch (error: Exception) {
+            failed = error
+        } finally {
+            if (dialPermit) dialSlots.release()
         }
-        val remote = socket.getInputStream()
-        val chunk = ByteArray(1200)
-        while (running.get() && !flow.closed) {
-            val n = remote.read(chunk)
-            if (n < 0) break
-            if (n == 0) continue
-            flow.down += n
-            sendTcp(flow, ACK or PSH, chunk, n)
+        if (failed != null) {
+            try { socket.close() } catch (_: Exception) {}
+            throw failed
         }
-        if (!flow.closed) sendTcp(flow, ACK or FIN, null, 0)
-        ConnLog.add("$dest — конец, от приложения ${flow.up} байт, обратно ${flow.down}")
-        flow.close()
+        if (flow.closed) {
+            try { socket.close() } catch (_: Exception) {}
+            return
+        }
+        var livePermit = false
+        try {
+            if (decision.kind == RouteKind.PROXY && proxy != null && !flow.priority) {
+                if (!proxySlots.tryAcquire(8, TimeUnit.SECONDS)) {
+                    try { socket.close() } catch (_: Exception) {}
+                    throw IllegalStateException("прокси занят, повтор позже")
+                }
+                livePermit = true
+            }
+            ConnLog.add("$dest — открыто с ${socket.localAddress?.hostAddress ?: "?"}")
+            synchronized(flow) {
+                if (flow.closed) {
+                    socket.close()
+                    return
+                }
+                socket.getOutputStream().write(flow.buffered.toByteArray())
+                flow.buffered.reset()
+                flow.upstream = socket
+                flow.dialing = false
+            }
+            val remote = socket.getInputStream()
+            val chunk = ByteArray(1200)
+            while (running.get() && !flow.closed) {
+                if (!awaitCredit(flow, chunk.size)) {
+                    ConnLog.add("$dest — приложение не принимает данные")
+                    break
+                }
+                if (flow.closed) break
+                val n = remote.read(chunk)
+                if (n < 0) break
+                if (n == 0) continue
+                flow.down += n
+                sendTcp(flow, ACK or PSH, chunk, n)
+            }
+            if (!flow.closed) sendTcp(flow, ACK or FIN, null, 0)
+            ConnLog.add("$dest — конец, от приложения ${flow.up} байт, обратно ${flow.down}")
+            flow.close()
+        } finally {
+            if (livePermit) proxySlots.release()
+        }
     }
 
     private fun payloadReady(flow: Flow): Boolean {
@@ -491,7 +548,8 @@ class StopVpnService : VpnService() {
 
     private fun sendTcp(flow: Flow, flags: Int, payload: ByteArray?, payloadLen: Int) {
         if (!running.get()) return
-        synchronized(flow.sendLock) {
+        val pkt = synchronized(flow.sendLock) {
+        if (flow.closed) return
         val tcpHdr = if (flags and SYN != 0) 24 else 20
         val total = 20 + tcpHdr + payloadLen
         val pkt = ByteArray(total)
@@ -519,10 +577,24 @@ class StopVpnService : VpnService() {
         if (payload != null && payloadLen > 0) payload.copyInto(pkt, tcp + tcpHdr, 0, payloadLen)
         put16(pkt, tcp + 16, 0)
         put16(pkt, tcp + 16, tcpChecksum(flow.dstIp, flow.srcIp, pkt, tcp, tcpHdr + payloadLen))
-        writeTun(pkt, total)
         var advance = payloadLen
         if (flags and (SYN or FIN) != 0) advance += 1
         flow.sendSeq = (flow.sendSeq + advance) and MASK
+        accountBulk(flow)
+        pkt
+        }
+        try {
+            when {
+                payloadLen == 0 -> tunUrgent.offer(pkt)
+                flow.priority -> {
+                    if (!tunInteractive.offer(pkt, 8, TimeUnit.SECONDS)) flow.close()
+                }
+                else -> {
+                    if (!tunBulk.offer(pkt, 8, TimeUnit.SECONDS)) flow.close()
+                }
+            }
+        } catch (_: InterruptedException) {
+            flow.close()
         }
     }
 
@@ -568,11 +640,8 @@ class StopVpnService : VpnService() {
     }
 
     private fun writeTun(packet: ByteArray, len: Int) {
-        val out = output ?: return
-        synchronized(outLock) {
-            out.write(packet, 0, len)
-            out.flush()
-        }
+        val copy = if (len == packet.size) packet else packet.copyOf(len)
+        if (!tunUrgent.offer(copy)) tunInteractive.offer(copy)
     }
 
     private fun nextIpId(): Int = synchronized(this) { ipId = (ipId + 1) and 0xffff; ipId }
@@ -637,6 +706,33 @@ class StopVpnService : VpnService() {
         }, "stopRKN-beat").start()
     }
 
+    private fun startWriter() {
+        val thread = Thread({
+            while (running.get()) {
+                val pkt = try {
+                    tunUrgent.poll()
+                        ?: tunInteractive.poll()
+                        ?: tunBulk.poll(10, TimeUnit.MILLISECONDS)
+                        ?: continue
+                } catch (_: InterruptedException) {
+                    break
+                }
+                val out = output ?: continue
+                try {
+                    synchronized(outLock) {
+                        out.write(pkt)
+                        out.flush()
+                    }
+                } catch (error: Exception) {
+                    if (!running.get()) break
+                    Log.w(TAG, "туннель: ${error.message}")
+                }
+            }
+        }, "stopRKN-write")
+        writer = thread
+        thread.start()
+    }
+
     private fun showForeground() {
         if (Build.VERSION.SDK_INT >= 34) {
             startForeground(
@@ -683,6 +779,10 @@ class StopVpnService : VpnService() {
             stopSelf()
             return
         }
+        writer?.interrupt()
+        tunUrgent.clear()
+        tunInteractive.clear()
+        tunBulk.clear()
         flows.values.forEach { it.close() }
         flows.clear()
         try { output?.close() } catch (_: Exception) {}
@@ -707,14 +807,225 @@ class StopVpnService : VpnService() {
         @Volatile var dialing: Boolean = false
         @Volatile var closed: Boolean = false
         @Volatile var label: String = ""
+        @Volatile var priority: Boolean = false
+        @Volatile var peerWindow: Int = 65535
+        @Volatile var una: Long = sendSeq
         @Volatile var up: Long = 0
         @Volatile var down: Long = 0
+        var bulkAccounted: Int = 0
+        var onClose: (() -> Unit)? = null
         val buffered = ByteArrayOutputStream()
         fun key() = "$srcIp:$srcPort:$dstIp:$dstPort"
         fun close() {
-            closed = true
+            val first: Boolean
+            synchronized(sendLock) {
+                first = !closed
+                closed = true
+                (sendLock as java.lang.Object).notifyAll()
+            }
             try { upstream?.close() } catch (_: Exception) {}
+            if (first) {
+                try { onClose?.invoke() } catch (_: Exception) {}
+            }
         }
+    }
+
+    private data class DnsHit(val reply: ByteArray, val until: Long)
+
+    private fun lookupDns(payload: ByteArray): ByteArray? {
+        cachedDns(payload)?.let { return it }
+        if (!dnsSlots.tryAcquire(2, TimeUnit.SECONDS)) return null
+        try {
+            cachedDns(payload)?.let { return it }
+            val reply = queryDns(payload, "1.1.1.1", 1500) ?: queryDns(payload, "8.8.8.8", 1500) ?: return null
+            if (reply.size >= 12 && (reply[3].toInt() and 0x0f) == 0) {
+                val key = dnsQuestionKey(payload)
+                if (key != null) {
+                    dnsCache[key] = DnsHit(reply, android.os.SystemClock.elapsedRealtime() + 60_000)
+                    if (dnsCache.size > 300) dnsCache.clear()
+                }
+            }
+            return reply
+        } finally {
+            dnsSlots.release()
+        }
+    }
+
+    private fun queryDns(payload: ByteArray, server: String, timeoutMs: Int): ByteArray? {
+        val socket = DatagramSocket()
+        try {
+            detach(socket)
+            socket.soTimeout = timeoutMs
+            socket.send(DatagramPacket(payload, payload.size, InetAddress.getByName(server), 53))
+            val buf = ByteArray(1500)
+            val packet = DatagramPacket(buf, buf.size)
+            socket.receive(packet)
+            if (packet.length < 12) return null
+            return buf.copyOf(packet.length)
+        } catch (_: Exception) {
+            return null
+        } finally {
+            try { socket.close() } catch (_: Exception) {}
+        }
+    }
+
+    private fun cachedDns(payload: ByteArray): ByteArray? {
+        val key = dnsQuestionKey(payload) ?: return null
+        val hit = dnsCache[key] ?: return null
+        if (hit.until < android.os.SystemClock.elapsedRealtime()) {
+            dnsCache.remove(key, hit)
+            return null
+        }
+        val copy = hit.reply.copyOf()
+        if (copy.size >= 2 && payload.size >= 2) {
+            copy[0] = payload[0]
+            copy[1] = payload[1]
+        }
+        return copy
+    }
+
+    private fun dnsQuestionKey(payload: ByteArray): String? {
+        if (payload.size < 12) return null
+        var i = 12
+        val name = StringBuilder()
+        while (i < payload.size) {
+            val len = payload[i].toInt() and 0xff
+            if (len == 0) {
+                i += 1
+                break
+            }
+            if (len and 0xc0 != 0 || i + 1 + len > payload.size) return null
+            if (name.isNotEmpty()) name.append('.')
+            name.append(String(payload, i + 1, len, Charsets.US_ASCII).lowercase())
+            i += 1 + len
+        }
+        if (i + 4 > payload.size) return null
+        return "$name|${u16(payload, i)}"
+    }
+
+    private fun logDnsFail(dstIp: Long) {
+        val now = android.os.SystemClock.elapsedRealtime()
+        synchronized(this) {
+            if (now - lastDnsLog < 3000) return
+            lastDnsLog = now
+        }
+        ConnLog.add("DNS ${ipText(dstIp)} — нет ответа")
+    }
+
+    private fun rejectUdp(buf: ByteArray, total: Int, srcIp: Long, dstIp: Long, srcPort: Int, dstPort: Int) {
+        noteUdp(dstIp, dstPort)
+        if (dstPort == 443) {
+            val ihl = (buf[0].toInt() and 0x0f) * 4
+            val payloadLen = (total - ihl - 8).coerceAtLeast(0)
+            val refuse = quicRefuse(buf, ihl + 8, payloadLen)
+            if (refuse != null) sendUdp(dstIp, srcIp, dstPort, srcPort, refuse, refuse.size)
+        }
+        val key = "$dstIp:$dstPort"
+        val now = android.os.SystemClock.elapsedRealtime()
+        synchronized(icmpAt) {
+            val prev = icmpAt[key] ?: 0L
+            if (now - prev < 500) return
+            icmpAt[key] = now
+            if (icmpAt.size > 200) icmpAt.clear()
+        }
+        sendUnreachable(buf, total, srcIp, dstIp)
+    }
+
+    private fun sendUnreachable(buf: ByteArray, total: Int, srcIp: Long, dstIp: Long) {
+        if (total < 20) return
+        val ihl = (buf[0].toInt() and 0x0f) * 4
+        if (ihl < 20 || total < ihl) return
+        val quoteLen = total.coerceAtMost(ihl + 8)
+        val icmpLen = 8 + quoteLen
+        val packetLen = 20 + icmpLen
+        val pkt = ByteArray(packetLen)
+        pkt[0] = 0x45
+        put16(pkt, 2, packetLen)
+        put16(pkt, 4, nextIpId())
+        pkt[8] = 64
+        pkt[9] = 1
+        put32(pkt, 12, dstIp)
+        put32(pkt, 16, srcIp)
+        put16(pkt, 10, inetChecksum(pkt, 0, 20))
+        pkt[20] = 3
+        pkt[21] = 3
+        buf.copyInto(pkt, 28, 0, quoteLen)
+        put16(pkt, 22, inetChecksum(pkt, 20, icmpLen))
+        writeTun(pkt, packetLen)
+    }
+
+    private fun acceptAck(flow: Flow, ack: Long, window: Int) {
+        synchronized(flow.sendLock) {
+            val inflight = (flow.sendSeq - flow.una) and MASK
+            val ahead = (ack - flow.una) and MASK
+            if (ahead <= inflight) flow.una = ack
+            flow.peerWindow = window
+            accountBulk(flow)
+            (flow.sendLock as java.lang.Object).notifyAll()
+        }
+    }
+
+    private fun accountBulk(flow: Flow) {
+        if (flow.priority && flow.bulkAccounted == 0) return
+        val now = if (flow.priority) 0 else ((flow.sendSeq - flow.una) and MASK).toInt()
+        val delta = now - flow.bulkAccounted
+        if (delta == 0) return
+        flow.bulkAccounted = now
+        bulkInflight.addAndGet(delta)
+    }
+
+    private fun releaseBulk(flow: Flow) {
+        synchronized(flow.sendLock) {
+            if (flow.bulkAccounted != 0) {
+                bulkInflight.addAndGet(-flow.bulkAccounted)
+                flow.bulkAccounted = 0
+            }
+        }
+    }
+
+    private fun awaitCredit(flow: Flow, bytes: Int): Boolean {
+        val deadline = android.os.SystemClock.elapsedRealtime() + 15000
+        synchronized(flow.sendLock) {
+            while (running.get() && !flow.closed) {
+                val inflight = ((flow.sendSeq - flow.una) and MASK).toInt()
+                val flowOk = inflight + bytes <= 48 * 1024 && flow.peerWindow > 0
+                val globalOk = flow.priority || bulkInflight.get() <= 96 * 1024
+                if (flowOk && globalOk) return true
+                if (android.os.SystemClock.elapsedRealtime() >= deadline) return false
+                try {
+                    (flow.sendLock as java.lang.Object).wait(200)
+                } catch (_: InterruptedException) {
+                    return false
+                }
+            }
+            return false
+        }
+    }
+
+    private fun quicRefuse(buf: ByteArray, off: Int, len: Int): ByteArray? {
+        if (len < 7 || buf[off].toInt() and 0x80 == 0 || u32(buf, off + 1) == 0L) return null
+        var i = off + 5
+        val end = off + len
+        if (i >= end) return null
+        val dcidLen = buf[i].toInt() and 0xff
+        i += 1
+        if (dcidLen > 20 || i + dcidLen > end) return null
+        val dcidOff = i
+        i += dcidLen
+        if (i >= end) return null
+        val scidLen = buf[i].toInt() and 0xff
+        i += 1
+        if (scidLen > 20 || i + scidLen > end) return null
+        val scidOff = i
+        val out = ByteArray(7 + scidLen + dcidLen)
+        out[0] = 0x80.toByte()
+        var p = 5
+        out[p++] = scidLen.toByte()
+        buf.copyInto(out, p, scidOff, scidOff + scidLen)
+        p += scidLen
+        out[p++] = dcidLen.toByte()
+        buf.copyInto(out, p, dcidOff, dcidOff + dcidLen)
+        return out
     }
 
     private fun noteUdp(dstIp: Long, dstPort: Int) {
@@ -723,7 +1034,7 @@ class StopVpnService : VpnService() {
             if (!udpNoted.add(key)) return
             if (udpNoted.size > 200) udpNoted.clear()
         }
-        val why = if (dstPort == 443) "QUIC отброшен, нужен TCP" else "UDP не проксируется"
+        val why = if (dstPort == 443) "QUIC закрыт, нужен TCP" else "UDP не проксируется"
         ConnLog.add("UDP ${ipText(dstIp)}:$dstPort — $why")
     }
 
