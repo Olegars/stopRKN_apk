@@ -8,6 +8,7 @@ import android.content.Intent
 import android.os.SystemClock
 import android.net.ConnectivityManager
 import android.net.IpPrefix
+import android.net.LinkProperties
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.VpnService
@@ -44,16 +45,17 @@ class StopVpnService : VpnService() {
     private val detachWarned = AtomicBoolean(false)
     private val workers = Executors.newCachedThreadPool()
     private val outLock = Any()
-    private val tunUrgent = ArrayBlockingQueue<ByteArray>(96)
+    private val tunUrgent = ArrayBlockingQueue<ByteArray>(256)
     private val tunInteractive = ArrayBlockingQueue<ByteArray>(64)
     private val tunBulk = ArrayBlockingQueue<ByteArray>(48)
     private val bulkInflight = AtomicInteger(0)
     private val dialSlots = Semaphore(24, true)
     private val proxySlots = Semaphore(48, true)
-    private val dnsSlots = Semaphore(8, true)
+    private val dnsSlots = Semaphore(32, true)
     private val dnsCache = ConcurrentHashMap<String, DnsHit>()
     private val icmpAt = HashMap<String, Long>()
     private var lastDnsLog = 0L
+    private var lastCapLog = 0L
     @Volatile private var writer: Thread? = null
     private var ipId = 1
     private lateinit var nets: Map<String, List<Cidr>>
@@ -317,9 +319,27 @@ class StopVpnService : VpnService() {
                 noteProxy(dstIp, dstPort)
                 return
             }
-            if (flows.size > 300) return
+            val existing = flows[key]
+            if (existing != null && !existing.closed) {
+                val next = (existing.una + 1) and MASK
+                if (existing.upstream == null && existing.sendSeq == next)
+                    sendTcp(existing, SYN or ACK, null, 0, existing.una)
+                return
+            }
+            if (existing != null) flows.remove(key, existing)
+            if (flows.size >= 300) {
+                val now = android.os.SystemClock.elapsedRealtime()
+                if (now - lastCapLog > 5000) {
+                    lastCapLog = now
+                    ConnLog.add("слишком много соединений (${flows.size}), новые пока не открываются")
+                }
+                return
+            }
             val flow = Flow(srcIp, dstIp, srcPort, dstPort, (seq + 1) and MASK, Random.nextLong() and MASK, android.os.SystemClock.elapsedRealtime())
-            flow.onClose = { releaseBulk(flow) }
+            flow.onClose = {
+                releaseBulk(flow)
+                flows.remove(flow.key(), flow)
+            }
             flows[key] = flow
             sendTcp(flow, SYN or ACK, null, 0)
             return
@@ -329,7 +349,7 @@ class StopVpnService : VpnService() {
         if (flags and ACK != 0) acceptAck(flow, u32(buf, ihl + 8), u16(buf, ihl + 14))
         if (payloadLen > 0) {
             if (seq != flow.expect) {
-                if (seq < flow.expect) sendTcp(flow, ACK, null, 0)
+                if (seqLess(seq, flow.expect)) sendTcp(flow, ACK, null, 0)
                 return
             }
             val payload = buf.copyOfRange(ihl + dataOff, ihl + dataOff + payloadLen)
@@ -337,28 +357,29 @@ class StopVpnService : VpnService() {
             flow.up += payloadLen
             sendTcp(flow, ACK, null, 0)
             var direct = false
+            var queued = false
             synchronized(flow) {
-                val socket = flow.upstream
-                if (socket != null) {
-                    try {
-                        socket.getOutputStream().write(payload)
-                    } catch (error: Exception) {
-                        ConnLog.add("${flow.label} — запись: ${error.message ?: "ошибка"}")
-                        flow.close()
-                    }
+                if (flow.upstream != null) {
+                    flow.upQueue.addLast(payload)
+                    queued = true
                 } else {
                     flow.buffered.write(payload)
                     direct = true
                 }
             }
             if (direct) dial(flow, false)
+            else if (queued) kickWrite(flow)
         }
         if (flags and FIN != 0) {
-            flow.expect = (flow.expect + 1) and MASK
-            sendTcp(flow, ACK or FIN, null, 0)
-            flow.close()
-            flows.remove(key)
-            return
+            val finSeq = (seq + payloadLen) and MASK
+            if (!flow.clientFin && finSeq == flow.expect) {
+                flow.expect = (flow.expect + 1) and MASK
+                flow.clientFin = true
+                sendTcp(flow, ACK, null, 0)
+                kickWrite(flow)
+            } else if (flow.clientFin) {
+                sendTcp(flow, ACK, null, 0)
+            }
         }
         if (payloadLen == 0 && flags and ACK != 0 && flow.upstream == null && dstPort != 443 && dstPort != 80) {
             dial(flow, true)
@@ -375,12 +396,15 @@ class StopVpnService : VpnService() {
             try {
                 openUpstream(flow)
             } catch (error: Exception) {
+                if (flow.closed) {
+                    flow.close()
+                    return@execute
+                }
                 val where = flow.label.ifBlank { "${ipText(flow.dstIp)}:${flow.dstPort}" }
                 Log.w(TAG, "соединение $where: ${error.message}")
                 ConnLog.add("$where — ${error.message ?: "ошибка"}")
                 sendTcp(flow, RST or ACK, null, 0)
                 flow.close()
-                flows.remove(flow.key())
             }
         }
     }
@@ -464,11 +488,13 @@ class StopVpnService : VpnService() {
                     socket.close()
                     return
                 }
-                socket.getOutputStream().write(flow.buffered.toByteArray())
-                flow.buffered.reset()
                 flow.upstream = socket
+                val data = flow.buffered.toByteArray()
+                if (data.isNotEmpty()) flow.upQueue.addLast(data)
+                flow.buffered.reset()
                 flow.dialing = false
             }
+            kickWrite(flow)
             val remote = socket.getInputStream()
             val chunk = ByteArray(1200)
             while (running.get() && !flow.closed) {
@@ -483,8 +509,10 @@ class StopVpnService : VpnService() {
                 flow.down += n
                 sendTcp(flow, ACK or PSH, chunk, n)
             }
-            if (!flow.closed) sendTcp(flow, ACK or FIN, null, 0)
-            ConnLog.add("$dest — конец, от приложения ${flow.up} байт, обратно ${flow.down}")
+            if (!flow.closed) {
+                sendTcp(flow, ACK or FIN, null, 0)
+                ConnLog.add("$dest — конец, от приложения ${flow.up} байт, обратно ${flow.down}")
+            }
             flow.close()
         } finally {
             if (livePermit) proxySlots.release()
@@ -546,7 +574,64 @@ class StopVpnService : VpnService() {
         return acc.toString(Charsets.ISO_8859_1.name())
     }
 
-    private fun sendTcp(flow: Flow, flags: Int, payload: ByteArray?, payloadLen: Int) {
+    private fun kickWrite(flow: Flow) {
+        synchronized(flow) {
+            if (flow.writing || flow.closed || flow.outputShut || flow.upstream == null) return
+            if (flow.upQueue.isEmpty() && !flow.clientFin) return
+            flow.writing = true
+        }
+        workers.execute {
+            try {
+                drainWrites(flow)
+            } catch (error: Exception) {
+                if (!flow.closed) {
+                    val where = flow.label.ifBlank { "${ipText(flow.dstIp)}:${flow.dstPort}" }
+                    ConnLog.add("$where — запись: ${error.message ?: "ошибка"}")
+                    sendTcp(flow, RST or ACK, null, 0)
+                    flow.close()
+                }
+            }
+        }
+    }
+
+    private fun drainWrites(flow: Flow) {
+        val socket = flow.upstream ?: return
+        val out = socket.getOutputStream()
+        while (!flow.closed) {
+            val batch = synchronized(flow) {
+                if (flow.upQueue.isNotEmpty()) {
+                    val queued = ArrayList(flow.upQueue)
+                    flow.upQueue.clear()
+                    queued
+                } else if (flow.clientFin && !flow.outputShut) {
+                    flow.outputShut = true
+                    emptyList()
+                } else {
+                    flow.writing = false
+                    if (flow.upQueue.isNotEmpty() || (flow.clientFin && !flow.outputShut)) {
+                        flow.writing = true
+                        null
+                    } else {
+                        return
+                    }
+                }
+            }
+            if (batch == null) continue
+            for (part in batch) out.write(part)
+            if (flow.outputShut) {
+                try {
+                    socket.shutdownOutput()
+                } catch (_: Exception) {
+                }
+                synchronized(flow) { flow.writing = false }
+                return
+            }
+        }
+    }
+
+    private fun seqLess(a: Long, b: Long): Boolean = ((a - b) and MASK) > 0x80000000L
+
+    private fun sendTcp(flow: Flow, flags: Int, payload: ByteArray?, payloadLen: Int, pinnedSeq: Long? = null) {
         if (!running.get()) return
         val pkt = synchronized(flow.sendLock) {
         if (flow.closed) return
@@ -564,7 +649,7 @@ class StopVpnService : VpnService() {
         val tcp = 20
         put16(pkt, tcp, flow.dstPort)
         put16(pkt, tcp + 2, flow.srcPort)
-        put32(pkt, tcp + 4, flow.sendSeq)
+        put32(pkt, tcp + 4, pinnedSeq ?: flow.sendSeq)
         put32(pkt, tcp + 8, flow.expect)
         pkt[tcp + 12] = ((tcpHdr / 4) shl 4).toByte()
         pkt[tcp + 13] = flags.toByte()
@@ -577,15 +662,17 @@ class StopVpnService : VpnService() {
         if (payload != null && payloadLen > 0) payload.copyInto(pkt, tcp + tcpHdr, 0, payloadLen)
         put16(pkt, tcp + 16, 0)
         put16(pkt, tcp + 16, tcpChecksum(flow.dstIp, flow.srcIp, pkt, tcp, tcpHdr + payloadLen))
-        var advance = payloadLen
-        if (flags and (SYN or FIN) != 0) advance += 1
-        flow.sendSeq = (flow.sendSeq + advance) and MASK
-        accountBulk(flow)
+        if (pinnedSeq == null) {
+            var advance = payloadLen
+            if (flags and (SYN or FIN) != 0) advance += 1
+            flow.sendSeq = (flow.sendSeq + advance) and MASK
+            accountBulk(flow)
+        }
         pkt
         }
         try {
             when {
-                payloadLen == 0 -> tunUrgent.offer(pkt)
+                payloadLen == 0 -> tunUrgent.offer(pkt, 50, TimeUnit.MILLISECONDS)
                 flow.priority -> {
                     if (!tunInteractive.offer(pkt, 8, TimeUnit.SECONDS)) flow.close()
                 }
@@ -808,6 +895,9 @@ class StopVpnService : VpnService() {
         @Volatile var closed: Boolean = false
         @Volatile var label: String = ""
         @Volatile var priority: Boolean = false
+        @Volatile var clientFin: Boolean = false
+        @Volatile var outputShut: Boolean = false
+        @Volatile var writing: Boolean = false
         @Volatile var peerWindow: Int = 65535
         @Volatile var una: Long = sendSeq
         @Volatile var up: Long = 0
@@ -815,6 +905,7 @@ class StopVpnService : VpnService() {
         var bulkAccounted: Int = 0
         var onClose: (() -> Unit)? = null
         val buffered = ByteArrayOutputStream()
+        val upQueue = java.util.ArrayDeque<ByteArray>()
         fun key() = "$srcIp:$srcPort:$dstIp:$dstPort"
         fun close() {
             val first: Boolean
@@ -832,12 +923,35 @@ class StopVpnService : VpnService() {
 
     private data class DnsHit(val reply: ByteArray, val until: Long)
 
+    private fun dnsServers(): List<String> {
+        val found = ArrayList<String>()
+        try {
+            val props: LinkProperties? = physicalNetwork()?.let {
+                getSystemService(ConnectivityManager::class.java)?.getLinkProperties(it)
+            }
+            for (addr in props?.dnsServers.orEmpty()) {
+                val text = addr.hostAddress ?: continue
+                if (':' in text || text == "0.0.0.0") continue
+                found.add(text)
+            }
+        } catch (_: Exception) {
+        }
+        if ("8.8.8.8" !in found) found.add("8.8.8.8")
+        if ("1.1.1.1" !in found) found.add("1.1.1.1")
+        return found.distinct().take(4)
+    }
+
     private fun lookupDns(payload: ByteArray): ByteArray? {
         cachedDns(payload)?.let { return it }
-        if (!dnsSlots.tryAcquire(2, TimeUnit.SECONDS)) return null
+        if (!dnsSlots.tryAcquire(1, TimeUnit.SECONDS)) return null
         try {
             cachedDns(payload)?.let { return it }
-            val reply = queryDns(payload, "1.1.1.1", 1500) ?: queryDns(payload, "8.8.8.8", 1500) ?: return null
+            var reply: ByteArray? = null
+            for (server in dnsServers()) {
+                reply = queryDns(payload, server, 800)
+                if (reply != null) break
+            }
+            if (reply == null) return null
             if (reply.size >= 12 && (reply[3].toInt() and 0x0f) == 0) {
                 val key = dnsQuestionKey(payload)
                 if (key != null) {
